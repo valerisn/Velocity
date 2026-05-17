@@ -10,135 +10,187 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
+#include <limits.h>
+
+#define CGROUP_BASE "/sys/fs/cgroup/velocity"
 
 struct container_args {
-    char **argv;
     char *rootfs;
+    char **argv;
+    long memory_limit;      // in bytes
+    int  cpu_shares;
 };
 
-void write_file(const char *path, const char *value) {
-    int fd = open(path, O_WRONLY);
-    if (fd == -1) {
-        perror("open");
-        exit(1);
-    }
-    write(fd, value, strlen(value));
+static void die(const char *msg)
+{
+    perror(msg);
+    exit(1);
+}
+
+static void write_file(const char *path, const char *value)
+{
+    int fd = open(path, O_WRONLY | O_CREAT, 0644);
+    if (fd == -1)
+        die("open");
+    if (write(fd, value, strlen(value)) == -1)
+        die("write");
     close(fd);
 }
 
-void setup_variables(int pid) {
-    char path[1024];
-    char map[1024];
+static void setup_user_namespace(pid_t pid)
+{
+    char path[256];
 
-    // CLONE_NEWUSER: User Namespace mapping
-    sprintf(path, "/proc/%d/uid_map", pid);
-    sprintf(map, "0 %d 1\n", getuid());
-    write_file(path, map);
-
-    sprintf(path, "/proc/%d/setgroups", pid);
+    snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
     write_file(path, "deny");
 
-    sprintf(path, "/proc/%d/gid_map", pid);
-    sprintf(map, "0 %d 1\n", getgid());
+    snprintf(path, sizeof(path), "/proc/%d/uid_map", pid);
+    char map[64];
+    snprintf(map, sizeof(map), "0 %d 1\n", getuid());
+    write_file(path, map);
+
+    snprintf(path, sizeof(path), "/proc/%d/gid_map", pid);
+    snprintf(map, sizeof(map), "0 %d 1\n", getgid());
     write_file(path, map);
 }
 
-void setup_cgroups(int pid) {
-    char path[1024];
-    sprintf(path, "/sys/fs/cgroup/velocity_%d", pid);
-    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
-        perror("mkdir cgroup");
-        return;
-    }
+static void setup_cgroups(pid_t pid, long memory_limit, int cpu_shares)
+{
+    char cgroup_path[256];
+    snprintf(cgroup_path, sizeof(cgroup_path), "%s_%d", CGROUP_BASE, pid);
 
-    char mem_path[1024];
-    sprintf(mem_path, "%s/memory.max", path);
-    write_file(mem_path, "268435456");
+    if (mkdir(cgroup_path, 0755) != 0 && errno != EEXIST)
+        die("mkdir cgroup");
 
-    char proc_path[1024];
-    sprintf(proc_path, "%s/cgroup.procs", path);
-    char pid_str[16];
-    sprintf(pid_str, "%d", pid);
-    write_file(proc_path, pid_str);
+    char subpath[512];
+
+    // Memory limit
+    snprintf(subpath, sizeof(subpath), "%s/memory.max", cgroup_path);
+    char mem_str[32];
+    snprintf(mem_str, sizeof(mem_str), "%ld", memory_limit);
+    write_file(subpath, mem_str);
+
+    // CPU shares
+    snprintf(subpath, sizeof(subpath), "%s/cpu.weight", cgroup_path);
+    snprintf(mem_str, sizeof(mem_str), "%d", cpu_shares);
+    write_file(subpath, mem_str);
+
+    // Add process
+    snprintf(subpath, sizeof(subpath), "%s/cgroup.procs", cgroup_path);
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", pid);
+    write_file(subpath, pid_str);
 }
 
-int run_container(struct container_args *args) {
-    if (sethostname("velocity", 8) != 0) {
-        perror("sethostname");
-        return 1;
-    }
+static void mount_filesystems(const char *rootfs)
+{
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+        die("mount private");
 
-    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
-        perror("mount private");
-        return 1;
-    }
+    if (chroot(rootfs) != 0 || chdir("/") != 0)
+        die("chroot");
 
-    if (chroot(args->rootfs) != 0 || chdir("/") != 0) {
-        perror("chroot/chdir");
-        return 1;
-    }
+    // Essential mounts
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0)
+        die("mount proc");
 
-    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
-        perror("mount proc");
-        return 1;
-    }
+    if (mount("sysfs", "/sys", "sysfs", 0, NULL) != 0)
+        die("mount sys");
 
-    printf("Velocity: Executing %s\n", args->argv[0]);
-    if (execvp(args->argv[0], args->argv) == -1) {
-        perror("execvp");
-        umount2("/proc", MNT_DETACH);
-        return 1;
-    }
+    if (mount("tmpfs", "/tmp", "tmpfs", 0, NULL) != 0)
+        die("mount tmpfs");
 
-    return 0;
+    if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) != 0)
+        die("mount dev");
+
+    // Basic devices
+    mknod("/dev/null", S_IFCHR | 0666, makedev(1, 3));
+    mknod("/dev/zero", S_IFCHR | 0666, makedev(1, 5));
+    mknod("/dev/random", S_IFCHR | 0666, makedev(1, 8));
+    mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
 }
 
-int main(int argc, char **argv) {
+static int container_init(void *arg)
+{
+    struct container_args *args = arg;
+
+    if (sethostname("velocity", 8) != 0)
+        die("sethostname");
+
+    mount_filesystems(args->rootfs);
+
+    printf("[Velocity] Container started. Executing: %s\n", args->argv[0]);
+
+    if (execvp(args->argv[0], args->argv) == -1)
+        die("execvp");
+
+    return 1; // unreachable
+}
+
+int main(int argc, char **argv)
+{
     if (argc < 4 || strcmp(argv[1], "run") != 0) {
-        fprintf(stderr, "Usage: sudo ./velocity run --root <path> <cmd> [args...]\n");
+        fprintf(stderr, "Usage: %s run --root <rootfs> [options] <cmd> [args...]\n", argv[0]);
+        fprintf(stderr, "Options:\n");
+        fprintf(stderr, "  --memory <MB>     Memory limit in MB (default: 256)\n");
+        fprintf(stderr, "  --cpu <shares>    CPU weight (default: 1024)\n");
         return 1;
     }
 
-    struct container_args args;
-    args.rootfs = argv[3];
-    args.argv = &argv[4];
+    struct container_args args = {
+        .memory_limit = 256 * 1024 * 1024,
+        .cpu_shares = 1024,
+        .rootfs = NULL,
+        .argv = NULL
+    };
 
-    // CLONE_NEWUSER: User Namespace
-    // CLONE_NEWNS: Mount Namespace
-    // CLONE_NEWPID: PID Namespace
-    // CLONE_NEWUTS: UTS (Hostname) Namespace
-    int pid = fork();
+    int i = 2;
+    while (i < argc) {
+        if (strcmp(argv[i], "--root") == 0 && i + 1 < argc) {
+            args.rootfs = argv[++i];
+        } else if (strcmp(argv[i], "--memory") == 0 && i + 1 < argc) {
+            args.memory_limit = atol(argv[++i]) * 1024 * 1024;
+        } else if (strcmp(argv[i], "--cpu") == 0 && i + 1 < argc) {
+            args.cpu_shares = atoi(argv[++i]);
+        } else {
+            break;
+        }
+        i++;
+    }
 
-    if (pid < 0) {
-        perror("fork");
+    if (!args.rootfs || i >= argc) {
+        fprintf(stderr, "Error: --root is required and command must be provided\n");
         return 1;
     }
 
-    if (pid == 0) {
-        if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWUSER) != 0) {
-            perror("unshare");
-            exit(1);
-        }
+    args.argv = &argv[i];
 
-        int inner_pid = fork();
-        if (inner_pid == 0) {
-            exit(run_container(&args));
-        }
-        
-        int status;
-        waitpid(inner_pid, &status, 0);
-        exit(WEXITSTATUS(status));
-    }
+    // Stack for child
+    char *stack = malloc(1024 * 1024);
+    if (!stack)
+        die("malloc stack");
 
-    setup_variables(pid);
-    setup_cgroups(pid);
+    // Clone with multiple namespaces
+    int flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWUSER | CLONE_NEWIPC;
+    pid_t pid = clone(container_init, stack + 1024*1024, flags | SIGCHLD, &args);
 
-    waitpid(pid, NULL, 0);
-    
-    char cgroup_del[1024];
-    sprintf(cgroup_del, "/sys/fs/cgroup/velocity_%d", pid);
-    rmdir(cgroup_del);
+    if (pid == -1)
+        die("clone");
 
-    printf("Velocity: Container finished.\n");
+    setup_user_namespace(pid);
+    setup_cgroups(pid, args.memory_limit, args.cpu_shares);
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    // Cleanup
+    char cgroup_path[256];
+    snprintf(cgroup_path, sizeof(cgroup_path), "%s_%d", CGROUP_BASE, pid);
+    rmdir(cgroup_path);
+
+    free(stack);
+    printf("[Velocity] Container exited with status %d\n", WEXITSTATUS(status));
+
     return 0;
 }
